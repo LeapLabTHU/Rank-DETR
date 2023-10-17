@@ -2,7 +2,7 @@
 
 Yifan Pu, Weicong Liang, Yiduo Hao, Yuhui Yuan, Yukang Yang, Chao Zhang, Han Hu, and Gao Huang
 
-[[`arXiv`](https://arxiv.org/abs/2207.13080)] [[`BibTeX`](#citing-rank-detr)]
+[[`arXiv`](https://arxiv.org/abs/2310.08854)] [[`BibTeX`](#citing-rank-detr)]
 
 <div align="center">
   <img src="./assets/rank_detr_overview.png"/>
