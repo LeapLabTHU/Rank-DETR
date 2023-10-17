@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import math
 import torch
 import torch.nn as nn
@@ -26,8 +27,10 @@ from detrex.layers import (
 )
 from detrex.utils import inverse_sigmoid
 
+from fairscale.nn.checkpoint import checkpoint_wrapper
 
-class HDeformableDetrTransformerEncoder(TransformerLayerSequence):
+
+class RankDetrTransformerEncoder(TransformerLayerSequence):
     def __init__(
         self,
         embed_dim: int = 256,
@@ -38,8 +41,9 @@ class HDeformableDetrTransformerEncoder(TransformerLayerSequence):
         num_layers: int = 6,
         post_norm: bool = False,
         num_feature_levels: int = 4,
+        use_checkpoint: bool = True,
     ):
-        super(HDeformableDetrTransformerEncoder, self).__init__(
+        super(RankDetrTransformerEncoder, self).__init__(
             transformer_layers=BaseTransformerLayer(
                 attn=MultiScaleDeformableAttention(
                     embed_dim=embed_dim,
@@ -67,6 +71,11 @@ class HDeformableDetrTransformerEncoder(TransformerLayerSequence):
             self.post_norm_layer = nn.LayerNorm(self.embed_dim)
         else:
             self.post_norm_layer = None
+
+        # use encoder checkpoint
+        if use_checkpoint:
+            for layer in self.layers:
+                layer = checkpoint_wrapper(layer)
 
     def forward(
         self,
@@ -98,7 +107,7 @@ class HDeformableDetrTransformerEncoder(TransformerLayerSequence):
         return query
 
 
-class HDeformableDetrTransformerDecoder(TransformerLayerSequence):
+class RankDetrTransformerDecoder(TransformerLayerSequence):
     def __init__(
         self,
         embed_dim: int = 256,
@@ -109,9 +118,15 @@ class HDeformableDetrTransformerDecoder(TransformerLayerSequence):
         num_layers: int = 6,
         return_intermediate: bool = True,
         num_feature_levels: int = 4,
+        use_checkpoint: bool = True,
         look_forward_twice=True,
+        num_queries_one2one=300,
+        num_queries_one2many=1500,
+        two_stage_num_proposals=300,
+        rank_adaptive_classhead=True,
+        query_rank_layer=True,
     ):
-        super(HDeformableDetrTransformerDecoder, self).__init__(
+        super(RankDetrTransformerDecoder, self).__init__(
             transformer_layers=BaseTransformerLayer(
                 attn=[
                     MultiheadAttention(
@@ -152,6 +167,35 @@ class HDeformableDetrTransformerDecoder(TransformerLayerSequence):
         self.class_embed = None
         self.look_forward_twice = look_forward_twice
 
+        # Rank-adaptive Classification Head
+        self.rank_adaptive_classhead = rank_adaptive_classhead
+
+        # query rank layer
+        self.query_rank_layer = query_rank_layer
+        self.num_queries_one2one = num_queries_one2one
+        self.num_queries_one2many = num_queries_one2many
+        if self.query_rank_layer:
+            self.rank_aware_content_query = nn.ModuleList([
+                copy.deepcopy(nn.Embedding(two_stage_num_proposals, embed_dim))
+                for _ in range(num_layers - 1)
+            ])
+            for m in self.rank_aware_content_query.parameters():
+                nn.init.zeros_(m)
+
+            self.pre_racq_trans = nn.ModuleList([
+                copy.deepcopy(nn.Linear(embed_dim, embed_dim))
+                for _ in range(num_layers - 1)
+            ])
+            self.post_racq_trans = nn.ModuleList([
+                copy.deepcopy(nn.Linear(embed_dim * 2, embed_dim))
+                for _ in range(num_layers - 1)
+            ])
+
+        # decoder checkpoint
+        if use_checkpoint:
+            for layer in self.layers:
+                layer = checkpoint_wrapper(layer)
+
     def forward(
         self,
         query,
@@ -171,6 +215,29 @@ class HDeformableDetrTransformerDecoder(TransformerLayerSequence):
         intermediate = []
         intermediate_reference_points = []
         for layer_idx, layer in enumerate(self.layers):
+
+            # query rank layer
+            if layer_idx >= 1:
+                if self.query_rank_layer:
+                    output = torch.gather(
+                        output, 1, rank_indices.unsqueeze(-1).repeat(1, 1, output.shape[-1])
+                    )
+                    concat_term = self.pre_racq_trans[layer_idx - 1](
+                        self.rank_aware_content_query[layer_idx - 1].weight[:output.shape[1]].unsqueeze(0).expand(output.shape[0], -1, -1)
+                    )
+                    output = torch.cat((output, concat_term), dim=2)
+                    output = self.post_racq_trans[layer_idx - 1](output)
+                    query_pos = torch.gather(
+                        query_pos, 1, rank_indices.unsqueeze(-1).repeat(1, 1, query_pos.shape[-1])
+                    )
+                if (not self.query_rank_layer) and (self.rank_adaptive_classhead):
+                    output = torch.gather(
+                        output, 1, rank_indices.unsqueeze(-1).repeat(1, 1, output.shape[-1])
+                    )
+                    query_pos = torch.gather(
+                        query_pos, 1, rank_indices.unsqueeze(-1).repeat(1, 1, query_pos.shape[-1])
+                    )
+
             if reference_points.shape[-1] == 4:
                 reference_points_input = (
                     reference_points[:, :, None]
@@ -206,6 +273,30 @@ class HDeformableDetrTransformerDecoder(TransformerLayerSequence):
                 reference_points = new_reference_points.detach()
 
             if self.return_intermediate:
+
+                if (layer_idx >= 0) and (self.query_rank_layer or self.rank_adaptive_classhead):
+                    # generate rank indices
+                    outputs_class_tmp = self.class_embed[layer_idx](output)  # [bs, num_queries, embed_dim] -> [bs, num_queries, num_classes]
+                    rank_basis = outputs_class_tmp.sigmoid().max(dim=2, keepdim=False)[0] # tensor shape: [bs, num_queries]
+                    if self.training:
+                        rank_indices_one2one  = torch.argsort(rank_basis[:, : self.num_queries_one2one], dim=1, descending=True) # tensor shape: [bs, num_queries_one2one]
+                        rank_indices_one2many = torch.argsort(rank_basis[:, self.num_queries_one2one :], dim=1, descending=True) # tensor shape: [bs, num_queries_one2many]
+                        rank_indices = torch.cat(
+                            (
+                                rank_indices_one2one,
+                                rank_indices_one2many + torch.ones_like(rank_indices_one2many) * self.num_queries_one2one
+                            ),
+                            dim=1,
+                        ) # tensor shape: [bs, num_queries_one2one+num_queries_one2many]
+                    else:
+                        rank_indices = torch.argsort(rank_basis[:, : self.num_queries_one2one], dim=1, descending=True)
+                    rank_indices = rank_indices.detach()
+                    # rank the reference points
+                    reference_points = torch.gather(
+                        reference_points, 1, rank_indices.unsqueeze(-1).repeat(1, 1, reference_points.shape[-1]))
+                    new_reference_points = torch.gather(
+                        new_reference_points, 1, rank_indices.unsqueeze(-1).repeat(1, 1, new_reference_points.shape[-1]))
+
                 intermediate.append(output)
                 intermediate_reference_points.append(
                     new_reference_points if self.look_forward_twice else reference_points
@@ -217,7 +308,7 @@ class HDeformableDetrTransformerDecoder(TransformerLayerSequence):
         return output, reference_points
 
 
-class HDeformableDetrTransformer(nn.Module):
+class RankDetrTransformer(nn.Module):
     """Transformer module for Deformable DETR
 
     Args:
@@ -235,10 +326,13 @@ class HDeformableDetrTransformer(nn.Module):
         decoder=None,
         num_feature_levels=4,
         as_two_stage=False,
+        num_queries_one2one=300,
+        num_queries_one2many=1500,
         two_stage_num_proposals=300,
         mixed_selection=True,
+        rank_adaptive_classhead=True,
     ):
-        super(HDeformableDetrTransformer, self).__init__()
+        super(RankDetrTransformer, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.num_feature_levels = num_feature_levels

@@ -26,7 +26,7 @@ from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
 
 
-class HDeformableDETR(nn.Module):
+class RankDETR(nn.Module):
     """Implements the Deformable DETR model.
 
     Code is modified from the `official github repo
@@ -77,6 +77,7 @@ class HDeformableDETR(nn.Module):
         mixed_selection=True,
         k_one2many=6,
         lambda_one2many=1.0,
+        rank_adaptive_classhead=True,
     ):
         super().__init__()
         num_queries = num_queries_one2one + num_queries_one2many
@@ -160,6 +161,16 @@ class HDeformableDETR(nn.Module):
         self.mixed_selection = mixed_selection
         self.k_one2many = k_one2many
         self.lambda_one2many = lambda_one2many
+
+        # Rank-adaptive Classification Head
+        self.rank_adaptive_classhead = rank_adaptive_classhead
+        if self.rank_adaptive_classhead:
+            self.rank_adaptive_classhead_emb = nn.ModuleList([
+                copy.deepcopy(nn.Embedding(self.num_queries, num_classes))
+                for _ in range(transformer.decoder.num_layers)
+            ])
+            for m in self.rank_adaptive_classhead_emb.parameters():
+                nn.init.zeros_(m)
 
     def forward(self, batched_inputs):
         images = self.preprocess_image(batched_inputs)
@@ -248,6 +259,16 @@ class HDeformableDETR(nn.Module):
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
             outputs_class = self.class_embed[lvl](inter_states[lvl])
+
+            # Rank-adaptive Classification Head
+            if self.rank_adaptive_classhead:
+                bs, n_query = inter_states[lvl].shape[0], inter_states[lvl].shape[1]
+                # bs = batch_size in one gpu; n_query = num_queries_one2one+num_queries_one2many for training, num_queries_one2one for testing
+                rank_adaptive_classhead_emb_lvl = self.rank_adaptive_classhead_emb[lvl].weight[:n_query, :].unsqueeze(0).repeat(bs, 1, 1)
+                # tensor shape: [bs, n_query, num_classes]
+                outputs_class = outputs_class + rank_adaptive_classhead_emb_lvl
+                # tensor shape: [bs, n_query, num_classes]
+
             tmp = self.bbox_embed[lvl](inter_states[lvl])
             if reference.shape[-1] == 4:
                 tmp += reference

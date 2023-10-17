@@ -1,4 +1,4 @@
-from .h_deformable_detr_r50_50ep import train, dataloader, optimizer, model
+from .rank_detr_r50_50ep import train, dataloader, optimizer, model
 from detrex.config import get_config
 from detectron2.config import LazyCall as L
 from detectron2.layers import ShapeSpec
@@ -26,7 +26,16 @@ model.neck.in_features = ["p1", "p2", "p3"]
 model.with_box_refine = True
 model.as_two_stage = True
 
+model.transformer.encoder.use_checkpoint = True
+model.transformer.decoder.use_checkpoint = True
+
+model.rank_adaptive_classhead = True
+model.transformer.decoder.query_rank_layer = True
+model.criterion.GIoU_aware_class_loss = True
+model.criterion.matcher.iou_order_alpha = 4.0
+model.criterion.matcher.matcher_change_iter = 202500
+
 # modify training config
 train.init_checkpoint = "/mnt/pretrained_backbone/swin_tiny_patch4_window7_224.pth"
-train.output_dir = "./output/h_deformable_detr_swin_tiny_two_stage_36ep"
+train.output_dir = "./output/rank_detr_swin_tiny_two_stage_36ep"
 train.max_iter = 270000

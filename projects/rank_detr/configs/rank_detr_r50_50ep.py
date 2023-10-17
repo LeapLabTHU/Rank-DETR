@@ -1,5 +1,5 @@
 from detrex.config import get_config
-from .models.h_deformable_detr_r50 import model
+from .models.rank_detr_r50 import model
 
 dataloader = get_config("common/data/coco_detr.py").dataloader
 lr_multiplier = get_config("common/coco_schedule.py").lr_multiplier_50ep
@@ -8,7 +8,7 @@ train = get_config("common/train.py").train
 
 # modify training config
 train.init_checkpoint = "detectron2://ImageNetPretrained/torchvision/R-50.pkl"
-train.output_dir = "./output/h_deformable_detr_r50_50ep"
+train.output_dir = "./output/rank_detr_r50_50ep"
 
 # max training iterations
 train.max_iter = 375000

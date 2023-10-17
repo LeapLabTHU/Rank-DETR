@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import time
+import wandb
 import torch
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 
@@ -32,6 +33,16 @@ from detectron2.engine import (
 from detectron2.engine.defaults import create_ddp_model
 from detectron2.evaluation import inference_on_dataset, print_csv_format
 from detectron2.utils import comm
+from detectron2.utils.file_io import PathManager
+from detectron2.utils.events import (
+    CommonMetricPrinter, 
+    JSONWriter, 
+    TensorboardXWriter
+)
+from detectron2.checkpoint import DetectionCheckpointer
+
+from detrex.utils import WandbWriter
+
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
@@ -99,6 +110,7 @@ class Trainer(SimpleTrainer):
         """
         If you want to do something with the losses, you can wrap the model.
         """
+        self.model.module.criterion.matcher.iter = self.iter
         loss_dict = self.model(data)
         with autocast(enabled=self.amp):
             if isinstance(loss_dict, torch.Tensor):
@@ -220,6 +232,19 @@ def do_train(args, cfg):
         trainer=trainer,
     )
 
+    if comm.is_main_process():
+        output_dir = cfg.train.output_dir
+        PathManager.mkdirs(output_dir)
+        writers = [
+            CommonMetricPrinter(cfg.train.max_iter),
+            JSONWriter(os.path.join(output_dir, "metrics.json")),
+            TensorboardXWriter(output_dir),
+        ]
+        if cfg.train.wandb.enabled:
+            print("Wandb enabled")
+            PathManager.mkdirs(cfg.train.wandb.params.dir)
+            writers.append(WandbWriter(cfg))
+
     trainer.register_hooks(
         [
             hooks.IterationTimer(),
@@ -229,7 +254,7 @@ def do_train(args, cfg):
             else None,
             hooks.EvalHook(cfg.train.eval_period, lambda: do_test(cfg, model)),
             hooks.PeriodicWriter(
-                default_writers(cfg.train.output_dir, cfg.train.max_iter),
+                writers,
                 period=cfg.train.log_period,
             )
             if comm.is_main_process()
@@ -263,7 +288,14 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    parser = default_argument_parser()
+    parser.add_argument("--use_wandb", action="store_true", help="Whether to use wandb.")
+    parser.add_argument("--wandb_key", type=str, help="Wandb API key.")
+    args = parser.parse_args()
+
+    if args.use_wandb:
+        wandb.login(key=args.wandb_key)
+        
     launch(
         main,
         args.num_gpus,

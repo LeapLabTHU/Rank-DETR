@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .h_deformable_transformer import (
-    HDeformableDetrTransformerEncoder,
-    HDeformableDetrTransformerDecoder,
-    HDeformableDetrTransformer,
+from .rank_transformer import (
+    RankDetrTransformerEncoder,
+    RankDetrTransformerDecoder,
+    RankDetrTransformer,
 )
-from .h_deformable_detr import HDeformableDETR
-from .deformable_criterion import DeformableCriterion
+from .rank_detr import RankDETR
+from .rankdetr_criterion import RankDetrCriterion
+from .high_order_matcher import HighOrderMatcher
