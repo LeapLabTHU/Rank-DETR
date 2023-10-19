@@ -110,7 +110,10 @@ class Trainer(SimpleTrainer):
         """
         If you want to do something with the losses, you can wrap the model.
         """
-        self.model.module.criterion.matcher.iter = self.iter
+        if not isinstance(self.model, torch.nn.parallel.distributed.DistributedDataParallel):
+            self.model.criterion.matcher.iter = self.iter
+        else:
+            self.model.module.criterion.matcher.iter = self.iter
         loss_dict = self.model(data)
         with autocast(enabled=self.amp):
             if isinstance(loss_dict, torch.Tensor):
